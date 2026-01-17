@@ -28,9 +28,10 @@ const (
 
 	version = 0x02
 
-	typeHello = 0x01
-	typeAudio = 0x02
-	typeBye   = 0x03
+	typeHello  = 0x01
+	typeAudio  = 0x02
+	typeBye    = 0x03
+	typeStatus = 0x04
 
 	// NOTE: Your new spec reserves bits 1-7, but we keep VIA_RELAY in bit 1.
 	// Remove if you don't want the relay to mutate flags.
@@ -41,7 +42,11 @@ const (
 	authLen      = 16
 	audioHdrLen  = 2
 	maxAudioData = 800
+
+	statusPayloadLen = 2 // uint16 peer count
 )
+
+var relayDeviceID = deviceID{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 
 type deviceID [6]byte
 
@@ -54,6 +59,9 @@ type peer struct {
 	// Token bucket limiter (per device).
 	tokens     float64
 	lastRefill time.Time
+
+	// Dirty flag: peer needs STATUS update on next HELLO.
+	stateDirty bool
 }
 
 type config struct {
@@ -92,9 +100,13 @@ type relay struct {
 	mu    sync.RWMutex
 	peers map[deviceID]*peer
 
+	// Relay's own sequence counter for STATUS packets.
+	seq uint32
+
 	// Buffers reused to avoid per-packet allocations.
 	readBuf    []byte
 	forwardBuf []byte
+	statusBuf  []byte
 
 	// Reusable HMAC object (receive loop is single-threaded).
 	hmacObj hashHash
@@ -127,6 +139,7 @@ func newRelay(cfg config) *relay {
 		peers:      make(map[deviceID]*peer),
 		readBuf:    make([]byte, 2048),
 		forwardBuf: make([]byte, 2048),
+		statusBuf:  make([]byte, headerLen+statusPayloadLen),
 	}
 	r.m.started = time.Now()
 	r.hmacObj = hmac.New(sha256.New, r.cfg.key)
@@ -177,6 +190,32 @@ func parseSeq(pkt []byte) uint32 {
 	return binary.LittleEndian.Uint32(pkt[10:14])
 }
 
+func (r *relay) buildStatusPacket(peerCount uint16) []byte {
+	pkt := r.statusBuf
+
+	// Header
+	pkt[0] = magic0
+	pkt[1] = magic1
+	pkt[2] = version
+	pkt[3] = typeStatus
+	copy(pkt[4:10], relayDeviceID[:])
+	r.seq++
+	binary.LittleEndian.PutUint32(pkt[10:14], r.seq)
+	// Timestamp (bytes 14-17): 0
+	pkt[14], pkt[15], pkt[16], pkt[17] = 0, 0, 0, 0
+	// Flags (byte 18): 0
+	pkt[18] = 0
+	// Reserved (byte 19): 0
+	pkt[19] = 0
+	// Auth tag will be filled by signInPlace
+
+	// Payload: peer count
+	binary.LittleEndian.PutUint16(pkt[headerLen:], peerCount)
+
+	r.signInPlace(pkt)
+	return pkt
+}
+
 func (r *relay) rateAllow(p *peer, now time.Time) bool {
 	if r.cfg.rateLimitPPS <= 0 {
 		return true
@@ -200,20 +239,25 @@ func (r *relay) rateAllow(p *peer, now time.Time) bool {
 	return false
 }
 
-func (r *relay) upsertPeer(id deviceID, addr *net.UDPAddr, now time.Time) *peer {
+func (r *relay) upsertPeer(id deviceID, addr *net.UDPAddr, now time.Time) (p *peer, isNew bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	p := r.peers[id]
+	p = r.peers[id]
 	if p == nil {
-		p = &peer{}
+		p = &peer{stateDirty: true}
 		r.peers[id] = p
 		atomic.AddUint64(&r.m.peersAdded, 1)
 		atomic.AddInt64(&r.m.peersCurrent, 1)
+		// Mark all existing peers as dirty since peer count changed.
+		for _, other := range r.peers {
+			other.stateDirty = true
+		}
+		isNew = true
 	}
 	p.addr = addr
 	p.lastSeen = now
-	return p
+	return p, isNew
 }
 
 func (r *relay) expirePeers(now time.Time) int {
@@ -225,6 +269,12 @@ func (r *relay) expirePeers(now time.Time) int {
 		if now.Sub(p.lastSeen) > r.cfg.peerTimeout {
 			delete(r.peers, id)
 			n++
+		}
+	}
+	// If any peers expired, mark remaining peers as dirty.
+	if n > 0 {
+		for _, p := range r.peers {
+			p.stateDirty = true
 		}
 	}
 	return n
@@ -395,7 +445,7 @@ func main() {
 		id := parseDeviceID(pkt)
 		seq := parseSeq(pkt)
 
-		p := r.upsertPeer(id, addr, now)
+		p, _ := r.upsertPeer(id, addr, now)
 
 		allowed := true
 		r.mu.Lock()
@@ -414,6 +464,19 @@ func main() {
 		r.mu.Unlock()
 
 		if !allowed {
+			continue
+		}
+
+		// On HELLO, send STATUS if peer's state is dirty.
+		if ptype == typeHello {
+			r.mu.Lock()
+			if p.stateDirty {
+				peerCount := uint16(len(r.peers))
+				statusPkt := r.buildStatusPacket(peerCount)
+				_, _ = pc.WriteTo(statusPkt, addr)
+				p.stateDirty = false
+			}
+			r.mu.Unlock()
 			continue
 		}
 
@@ -448,4 +511,3 @@ func main() {
 		r.mu.RUnlock()
 	}
 }
-
