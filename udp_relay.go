@@ -475,6 +475,7 @@ func main() {
 				statusPkt := r.buildStatusPacket(peerCount)
 				_, _ = pc.WriteTo(statusPkt, addr)
 				p.stateDirty = false
+				log.Printf("sent STATUS to %s (peers=%d)", addr, peerCount)
 			}
 			r.mu.Unlock()
 			continue
