@@ -54,8 +54,6 @@ type peer struct {
 	addr     *net.UDPAddr
 	lastSeen time.Time
 
-	lastSeq uint32
-
 	// Token bucket limiter (per device).
 	tokens     float64
 	lastRefill time.Time
@@ -77,16 +75,15 @@ type config struct {
 type metrics struct {
 	started time.Time
 
-	recvTotal       uint64
-	fwdTotal        uint64
-	dropBadLen      uint64
-	dropBadMagic    uint64
-	dropBadVersion  uint64
-	dropBadType     uint64
-	dropBadAudio    uint64
-	dropBadMAC      uint64
-	dropReplayAudio uint64
-	dropRateLimit   uint64
+	recvTotal      uint64
+	fwdTotal       uint64
+	dropBadLen     uint64
+	dropBadMagic   uint64
+	dropBadVersion uint64
+	dropBadType    uint64
+	dropBadAudio   uint64
+	dropBadMAC     uint64
+	dropRateLimit  uint64
 
 	peersCurrent int64
 	peersAdded   uint64
@@ -184,10 +181,6 @@ func parseDeviceID(pkt []byte) deviceID {
 	var id deviceID
 	copy(id[:], pkt[4:10])
 	return id
-}
-
-func parseSeq(pkt []byte) uint32 {
-	return binary.LittleEndian.Uint32(pkt[10:14])
 }
 
 func (r *relay) buildStatusPacket(peerCount uint16) []byte {
@@ -312,7 +305,6 @@ func (r *relay) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 		"drop_bad_type":    atomic.LoadUint64(&r.m.dropBadType),
 		"drop_bad_audio":   atomic.LoadUint64(&r.m.dropBadAudio),
 		"drop_bad_mac":     atomic.LoadUint64(&r.m.dropBadMAC),
-		"drop_replay":      atomic.LoadUint64(&r.m.dropReplayAudio),
 		"drop_ratelimit":   atomic.LoadUint64(&r.m.dropRateLimit),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -443,27 +435,13 @@ func main() {
 		}
 
 		id := parseDeviceID(pkt)
-		seq := parseSeq(pkt)
-
 		p, _ := r.upsertPeer(id, addr, now)
 
-		allowed := true
 		r.mu.Lock()
-		if !r.rateAllow(p, now) {
-			allowed = false
-			atomic.AddUint64(&r.m.dropRateLimit, 1)
-		}
-		if allowed && ptype == typeAudio {
-			if seq <= p.lastSeq {
-				allowed = false
-				atomic.AddUint64(&r.m.dropReplayAudio, 1)
-			} else {
-				p.lastSeq = seq
-			}
-		}
+		allowed := r.rateAllow(p, now)
 		r.mu.Unlock()
-
 		if !allowed {
+			atomic.AddUint64(&r.m.dropRateLimit, 1)
 			continue
 		}
 
