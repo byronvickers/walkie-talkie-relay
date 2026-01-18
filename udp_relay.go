@@ -481,7 +481,7 @@ func main() {
 			continue
 		}
 
-		if ptype != typeAudio {
+		if ptype != typeAudio && ptype != typeBye {
 			continue
 		}
 
